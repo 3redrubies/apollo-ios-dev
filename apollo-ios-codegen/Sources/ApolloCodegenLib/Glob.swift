@@ -91,7 +91,11 @@ public struct Glob {
     includeMatches = includeMatches.compactMap({ path in
       return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     })
-    return OrderedSet<String>(includeMatches).subtracting(excludeMatches)
+    // Sort Swift-side so discovery order is deterministic across filesystems and platforms. The
+    // libc glob (GLOB_NOSORT) and FileManager.enumerator walk both yield filesystem-enumeration
+    // order (APFS != ext4); sorting the combined include list here fully determines the output
+    // order regardless of pattern or enumeration order upstream.
+    return OrderedSet<String>(includeMatches.sorted()).subtracting(excludeMatches)
   }
 
   /// Separates a comma-delimited string into paths, expanding any globstars and removes duplicates.

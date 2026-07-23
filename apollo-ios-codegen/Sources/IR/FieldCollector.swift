@@ -38,8 +38,34 @@ public actor FieldCollector {
     to referencedFields: inout [String: (GraphQLType, deprecationReason: String?)]
   ) {
     let key = field.responseKey
-    if !referencedFields.keys.contains(key) {
+    guard let existing = referencedFields[key] else {
       referencedFields[key] = (field.type, field.deprecationReason)
+      return
+    }
+    // Two selections legitimately share a response key with differing underlying types (e.g. an
+    // alias resolving to a different schema field). The IR is built concurrently
+    // (ApolloCodegen.swift task group -> shared FieldCollector actor), so the first arrival for a
+    // given key is nondeterministic. Choose the lexicographically-smallest type reference
+    // (tie-broken on deprecationReason) so the stored value is a stable function of the candidate
+    // set, independent of arrival order. Direction (min) is arbitrary but fixed; it preserves the
+    // previously-emitted output for existing consumers.
+    let incoming = (field.type, deprecationReason: field.deprecationReason)
+    if Self.isOrderedBefore(incoming, existing) {
+      referencedFields[key] = incoming
+    }
+  }
+
+  private static func isOrderedBefore(
+    _ lhs: (GraphQLType, deprecationReason: String?),
+    _ rhs: (GraphQLType, deprecationReason: String?)
+  ) -> Bool {
+    let lRef = lhs.0.typeReference, rRef = rhs.0.typeReference
+    if lRef != rRef { return lRef < rRef }
+    switch (lhs.deprecationReason, rhs.deprecationReason) {  // same type: nil sorts before non-nil
+    case (nil, nil): return false
+    case (nil, _):   return true
+    case (_, nil):   return false
+    case let (l?, r?): return l < r
     }
   }
 

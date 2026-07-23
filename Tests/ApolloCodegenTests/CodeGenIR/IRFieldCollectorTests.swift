@@ -581,5 +581,92 @@ class IRFieldCollectorTests: XCTestCase {
       return MatcherResult(status: .matches, message: message)
     }
   }
+
+  // MARK: - Deterministic conflicting-type resolution
+
+  // Two operations select the same response key `state` on `SportingGameSegment` with different
+  // underlying enum types (a raw field vs. an alias to a differently-typed field). In production
+  // the IR is built concurrently, so the collector must resolve this conflict deterministically
+  // regardless of the order operations are built. The chosen type is the lexicographically
+  // smallest `typeReference`, so `SportinGameSegmentState` (< `SportingGameSegmentState`) wins.
+  // See FieldCollector.add(_:to:).
+
+  private func collectedStateType(
+    buildingOperationsInReverseOrder reversed: Bool
+  ) async throws -> GraphQLType? {
+    schemaSDL = """
+    type Query {
+      segment: SportingGameSegment!
+    }
+
+    type SportingGameSegment {
+      state: SportinGameSegmentState
+      segmentState: SportingGameSegmentState
+    }
+
+    enum SportinGameSegmentState {
+      ACTIVE
+      COMPLETE
+    }
+
+    enum SportingGameSegmentState {
+      ACTIVE
+      COMPLETE
+    }
+    """
+
+    document = """
+    query RawState {
+      segment {
+        state
+      }
+    }
+
+    query AliasedState {
+      segment {
+        state: segmentState
+      }
+    }
+    """
+
+    ir = try await .mock(schema: schemaSDL, document: document)
+
+    let rawState = try ir.compilationResult.operations
+      .first { $0.name == "RawState" }.xctUnwrapped()
+    let aliasedState = try ir.compilationResult.operations
+      .first { $0.name == "AliasedState" }.xctUnwrapped()
+
+    let orderedOperations = reversed
+      ? [aliasedState, rawState]
+      : [rawState, aliasedState]
+
+    for operation in orderedOperations {
+      _ = await ir.build(operation: operation)
+    }
+
+    subject = ir.fieldCollector
+
+    let segment = try schema[object: "SportingGameSegment"].xctUnwrapped()
+    let fields = await subject.collectedFields(for: segment)
+    return fields.first { $0.0 == "state" }?.1
+  }
+
+  func test__collectedFields__givenConflictingTypesForResponseKey_buildingInDocumentOrder_selectsLexicographicallySmallestType() async throws {
+    // when
+    let stateType = try await collectedStateType(buildingOperationsInReverseOrder: false)
+
+    // then
+    // Qualified `Nimble.equal` because this class defines a shadowing `equal(_:)` for tuple fields.
+    expect(stateType?.typeReference).to(Nimble.equal("SportinGameSegmentState"))
+  }
+
+  func test__collectedFields__givenConflictingTypesForResponseKey_buildingInReverseOrder_selectsSameLexicographicallySmallestType() async throws {
+    // when
+    let stateType = try await collectedStateType(buildingOperationsInReverseOrder: true)
+
+    // then
+    // Reversing the build order must not change the collected type — this is the regression guard.
+    expect(stateType?.typeReference).to(Nimble.equal("SportinGameSegmentState"))
+  }
 }
 
