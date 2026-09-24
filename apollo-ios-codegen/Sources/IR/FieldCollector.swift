@@ -38,8 +38,32 @@ public actor FieldCollector {
     to referencedFields: inout [String: (GraphQLType, deprecationReason: String?)]
   ) {
     let key = field.responseKey
-    if !referencedFields.keys.contains(key) {
-      referencedFields[key] = (field.type, field.deprecationReason)
+    let value = (field.type, deprecationReason: field.deprecationReason)
+    if let existingValue = referencedFields[key], !Self.isOrdered(value, before: existingValue) {
+      return
+    }
+    referencedFields[key] = value
+  }
+
+  private static func isOrdered(
+    _ lhs: (GraphQLType, deprecationReason: String?),
+    before rhs: (GraphQLType, deprecationReason: String?)
+  ) -> Bool {
+    let lhsTypeReference = lhs.0.typeReference
+    let rhsTypeReference = rhs.0.typeReference
+    guard lhsTypeReference == rhsTypeReference else {
+      return lhsTypeReference < rhsTypeReference
+    }
+
+    switch (lhs.deprecationReason, rhs.deprecationReason) {
+    case let (lhsReason?, rhsReason?):
+      return lhsReason < rhsReason
+
+    case (nil, .some):
+      return true
+
+    default:
+      return false
     }
   }
 
