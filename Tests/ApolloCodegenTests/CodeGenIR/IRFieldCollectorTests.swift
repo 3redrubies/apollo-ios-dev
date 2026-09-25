@@ -13,6 +13,7 @@ class IRFieldCollectorTests: XCTestCase {
   var document: String!
   var ir: IRBuilder!
   var subject: IR.FieldCollector!
+  var compilationResult: CompilationResult!
 
   var schema: IR.Schema { ir.schema }
 
@@ -25,38 +26,33 @@ class IRFieldCollectorTests: XCTestCase {
     document = nil
     ir = nil
     subject = nil
+    compilationResult = nil
     super.tearDown()
   }
 
   // MARK: - Helpers
 
-  func buildIR() async throws {
-    ir = try await .mock(schema: schemaSDL, document: document)
-
-    for operation in ir.compilationResult.operations {
-      _ = await ir.build(operation: operation)
+  func buildIR(
+    operationOrder operationNames: [String]? = nil,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async throws {
+    if compilationResult == nil {
+      compilationResult = try await GraphQLJSFrontend().compile(schema: schemaSDL, document: document)
     }
+    ir = .mock(compilationResult: compilationResult)
 
-    subject = ir.fieldCollector
-  }
-
-  func collectedFields(
-    for objectName: String,
-    buildingOperationsInOrder operationNames: [String]
-  ) async throws -> ReferencedFields {
-    ir = try await .mock(schema: schemaSDL, document: document)
-
-    for operationName in operationNames {
-      let operation = try ir.compilationResult.operations
+    let operations = try operationNames?.map { operationName in
+      try compilationResult.operations
         .first { $0.name == operationName }
-        .xctUnwrapped()
+        .xctUnwrapped(file: file, line: line)
+    } ?? compilationResult.operations
+
+    for operation in operations {
       _ = await ir.build(operation: operation)
     }
 
     subject = ir.fieldCollector
-
-    let object = try schema[object: objectName].xctUnwrapped()
-    return await subject.collectedFields(for: object)
   }
 
   // MARK: - Tests
@@ -586,6 +582,8 @@ class IRFieldCollectorTests: XCTestCase {
       subtitle: String
       cover: Image
       thumbnail: Thumbnail
+      gallery: [Image]
+      strictGallery: [Image!]!
     }
 
     type Image {
@@ -604,6 +602,9 @@ class IRFieldCollectorTests: XCTestCase {
         cover {
           url
         }
+        gallery {
+          url
+        }
       }
     }
 
@@ -613,25 +614,27 @@ class IRFieldCollectorTests: XCTestCase {
         cover: thumbnail {
           url
         }
+        gallery: strictGallery {
+          url
+        }
       }
     }
     """
 
     // when
-    let documentOrderActual = try await collectedFields(
-      for: "Book",
-      buildingOperationsInOrder: ["BookQuery", "AliasedBookQuery"]
-    )
-    let reverseOrderActual = try await collectedFields(
-      for: "Book",
-      buildingOperationsInOrder: ["AliasedBookQuery", "BookQuery"]
-    )
+    try await buildIR(operationOrder: ["BookQuery", "AliasedBookQuery"])
+    let Book = try schema[object: "Book"].xctUnwrapped()
+    let documentOrderActual = await subject.collectedFields(for: Book)
+
+    try await buildIR(operationOrder: ["AliasedBookQuery", "BookQuery"])
+    let reverseOrderActual = await subject.collectedFields(for: Book)
 
     // then
     let Image = try schema[object: "Image"].xctUnwrapped()
 
     let expected: ReferencedFields = [
       ("cover", .entity(Image), nil),
+      ("gallery", .list(.entity(Image)), nil),
       ("title", .string(), nil)
     ]
 
@@ -649,6 +652,60 @@ class IRFieldCollectorTests: XCTestCase {
     type Book {
       title: String @deprecated(reason: "Use name.")
       name: String
+      label: String @deprecated(reason: "Use caption.")
+      caption: String @deprecated(reason: "Use heading.")
+      status: String @deprecated(reason: "Use state.")
+      state: String!
+    }
+    """
+
+    document = """
+    query BookQuery {
+      book {
+        title
+        label
+        status
+      }
+    }
+
+    query AliasedBookQuery {
+      book {
+        title: name
+        label: caption
+        status: state
+      }
+    }
+    """
+
+    // when
+    try await buildIR(operationOrder: ["BookQuery", "AliasedBookQuery"])
+    let Book = try schema[object: "Book"].xctUnwrapped()
+    let documentOrderActual = await subject.collectedFields(for: Book)
+
+    try await buildIR(operationOrder: ["AliasedBookQuery", "BookQuery"])
+    let reverseOrderActual = await subject.collectedFields(for: Book)
+
+    // then
+    let expected: ReferencedFields = [
+      ("label", .string(), "Use caption."),
+      ("status", .string(), "Use state."),
+      ("title", .string(), nil)
+    ]
+
+    expect(documentOrderActual).to(equal(expected))
+    expect(reverseOrderActual).to(equal(expected))
+  }
+
+  func test__collectedFields__givenResponseKeySelectedWithCanonicallyEquivalentDeprecationReasons_collectsSameReasonRegardlessOfBuildOrder() async throws {
+    // given
+    schemaSDL = """
+    type Query {
+      book: Book!
+    }
+
+    type Book {
+      title: String @deprecated(reason: "Caf\\u00E9")
+      name: String @deprecated(reason: "Cafe\\u0301")
     }
     """
 
@@ -667,18 +724,90 @@ class IRFieldCollectorTests: XCTestCase {
     """
 
     // when
-    let documentOrderActual = try await collectedFields(
-      for: "Book",
-      buildingOperationsInOrder: ["BookQuery", "AliasedBookQuery"]
-    )
-    let reverseOrderActual = try await collectedFields(
-      for: "Book",
-      buildingOperationsInOrder: ["AliasedBookQuery", "BookQuery"]
-    )
+    try await buildIR(operationOrder: ["BookQuery", "AliasedBookQuery"])
+    let Book = try schema[object: "Book"].xctUnwrapped()
+    let documentOrderActual = await subject.collectedFields(for: Book)
+
+    try await buildIR(operationOrder: ["AliasedBookQuery", "BookQuery"])
+    let reverseOrderActual = await subject.collectedFields(for: Book)
 
     // then
-    expect(documentOrderActual.map { $0.deprecationReason }).to(Nimble.equal([nil]))
-    expect(reverseOrderActual.map { $0.deprecationReason }).to(Nimble.equal([nil]))
+    let expected = [Array("Cafe\u{301}".utf8)]
+
+    expect(documentOrderActual.map { $0.deprecationReason.map { Array($0.utf8) } }).to(Nimble.equal(expected))
+    expect(reverseOrderActual.map { $0.deprecationReason.map { Array($0.utf8) } }).to(Nimble.equal(expected))
+  }
+
+  func test__collectedFields__givenResponseKeySelectedOnObjectAndInterfacesWithDifferentTypes_collectsSameTypeRegardlessOfWhereSelected() async throws {
+    // given
+    schemaSDL = """
+    type Query {
+      magazine: Magazine!
+      titled: Titled!
+      named: Named!
+    }
+
+    interface Titled {
+      title: String!
+      shortTitle: String
+    }
+
+    interface Named {
+      title: String!
+      shortTitle: String
+    }
+
+    type Book implements Titled & Named {
+      title: String!
+      shortTitle: String
+    }
+
+    type Magazine implements Named & Titled {
+      title: String!
+      shortTitle: String
+    }
+    """
+
+    document = """
+    query MagazineQuery {
+      magazine {
+        title
+      }
+    }
+
+    query TitledQuery {
+      titled {
+        title
+      }
+    }
+
+    query NamedQuery {
+      named {
+        title: shortTitle
+      }
+    }
+    """
+
+    // when
+    try await buildIR(operationOrder: ["MagazineQuery", "TitledQuery", "NamedQuery"])
+    let Book = try schema[object: "Book"].xctUnwrapped()
+    let Magazine = try schema[object: "Magazine"].xctUnwrapped()
+    let documentOrderBookActual = await subject.collectedFields(for: Book)
+    let documentOrderMagazineActual = await subject.collectedFields(for: Magazine)
+
+    try await buildIR(operationOrder: ["NamedQuery", "TitledQuery", "MagazineQuery"])
+    let reverseOrderBookActual = await subject.collectedFields(for: Book)
+    let reverseOrderMagazineActual = await subject.collectedFields(for: Magazine)
+
+    // then
+    let expected: ReferencedFields = [
+      ("title", .string(), nil)
+    ]
+
+    expect(documentOrderBookActual).to(equal(expected))
+    expect(documentOrderMagazineActual).to(equal(expected))
+    expect(reverseOrderBookActual).to(equal(expected))
+    expect(reverseOrderMagazineActual).to(equal(expected))
   }
 
   /// MARK: - Custom Matchers
@@ -694,7 +823,7 @@ class IRFieldCollectorTests: XCTestCase {
       }
 
       for (index, field) in zip(expected, actual).enumerated() {
-        guard field.0.0 == field.1.0, field.0.1 == field.1.1 else {
+        guard field.0.0 == field.1.0, field.0.1 == field.1.1, field.0.2 == field.1.2 else {
           return MatcherResult(
             status: .fail,
             message: message.appended(

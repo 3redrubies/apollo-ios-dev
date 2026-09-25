@@ -49,15 +49,19 @@ public actor FieldCollector {
     _ lhs: (GraphQLType, deprecationReason: String?),
     before rhs: (GraphQLType, deprecationReason: String?)
   ) -> Bool {
-    let lhsTypeReference = lhs.0.typeReference
-    let rhsTypeReference = rhs.0.typeReference
-    guard lhsTypeReference == rhsTypeReference else {
-      return lhsTypeReference < rhsTypeReference
+    let lhsTypeReference = lhs.0.typeReference.utf8
+    let rhsTypeReference = rhs.0.typeReference.utf8
+    guard lhsTypeReference.elementsEqual(rhsTypeReference) else {
+      // Ranking `!` after every other character keeps the variant that is nullable at the
+      // innermost wrapper where two otherwise identical types differ.
+      return lhsTypeReference.lexicographicallyPrecedes(rhsTypeReference) {
+        nullableFirstRank($0) < nullableFirstRank($1)
+      }
     }
 
     switch (lhs.deprecationReason, rhs.deprecationReason) {
     case let (lhsReason?, rhsReason?):
-      return lhsReason < rhsReason
+      return lhsReason.utf8.lexicographicallyPrecedes(rhsReason.utf8)
 
     case (nil, .some):
       return true
@@ -67,6 +71,10 @@ public actor FieldCollector {
     }
   }
 
+  private static func nullableFirstRank(_ byte: UInt8) -> UInt16 {
+    byte == UInt8(ascii: "!") ? 0x100 : UInt16(byte)
+  }
+
   public func collectedFields(
     for type: any GraphQLInterfaceImplementingType
   ) -> [(String, GraphQLType, deprecationReason: String?)] {
@@ -74,7 +82,9 @@ public actor FieldCollector {
 
     for interface in type.interfaces {
       if let interfaceFields = collectedFields[interface] {
-        fields.merge(interfaceFields) { field, _ in field }
+        fields.merge(interfaceFields) { field, interfaceField in
+          Self.isOrdered(interfaceField, before: field) ? interfaceField : field
+        }
       }
     }
 
