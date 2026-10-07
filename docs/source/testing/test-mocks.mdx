@@ -108,6 +108,8 @@ print(grevious.__typename) // "Droid"
 
 Each `MockObject` has generated properties for each field that could be fetched on that object type across all the operations in your project. If a field on your GraphQL schema is never fetched by your application, it won't be generated on your test mock objects.
 
+When different operations select the same response key on a type through different schema fields (for example `title` in one operation and `title: subtitle` in another), the test mock has one property for that response key. If the candidates describe the same schema field, as when an object narrows the type of an interface field, the object's own declaration is used. Otherwise the nullable type is preferred, and a non-deprecated field is preferred over a deprecated one, so the generated property is the same on every run of code generation.
+
 When using your test mocks in a unit test, you may only be concerned about a subset of the required fields on the response object. Test mocks don't require you to initialize values for any fields you are not using in your tests.
 
 You can initialize them with no data, and then set only the fields relevant for your test. Apollo iOS also generates convenience initializers for each concrete object type.
