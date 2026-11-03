@@ -44,14 +44,15 @@ Connection waiters use `[CheckedContinuation<Void, any Error>]` array pattern (s
 
 - Application-level JSON messages (separate from WebSocket-frame-level ping/pong)
 - On receiving `ping`: reply with `pong(payload: nil)` immediately — do NOT echo the ping's payload
-- On receiving `pong`: no action (break)
-- Client-initiated pings: `Configuration.pingInterval` (default `nil`/disabled). Timer starts after `connection_ack`, stops on disconnect/pause, restarts on reconnect. Implemented via `pingTimerTask` (`Task`) that captures the current `connection`.
+- On receiving `pong`: notify the delegate. Like any message, it also cancels a pending pong timeout
+- Client-initiated pings: `Configuration.pingInterval` (default `nil`/disabled). Timer starts after `connection_ack`, stops on disconnect/pause, restarts on reconnect. Implemented via `pingTimerTask` (`Task`) that captures the current `connection` and calls `sendPing(on:)`.
+- Pong timeout: `Configuration.pongTimeout` (default `nil`/disabled, needs `pingInterval`). The oldest unanswered ping starts `pongTimeoutTask`; any message on the current connection cancels it. On expiry, `handlePongTimeout(on:)` closes the connection and calls `handleDisconnection(of:error: .pongTimeout)` itself, because a stalled task may ignore `cancel` and never end its receive loop. `handleDisconnection` ignores a connection that is already `.disconnected`, so a late end of that receive loop is harmless.
 
 ## Testing
 
 Tests live in `Tests/ApolloTests/WebSocket/`. Mock infrastructure in `Tests/ApolloInternalTestHelpers/`:
 
-- **`MockWebSocketTask`** (`MockWebSocketTask.swift`) — Uses `AsyncStreamMocker<URLSessionWebSocketTask.Message>` for server→client messaging. API: `emit()` to send messages, `finish()` to end stream, `throw()` to inject errors. `clientSentMessages` captures outgoing messages for assertions.
+- **`MockWebSocketTask`** (`MockWebSocketTask.swift`) — Uses `AsyncStreamMocker<URLSessionWebSocketTask.Message>` for server→client messaging. API: `emit()` to send messages, `finish()` to end stream, `throw()` to inject errors. `clientSentMessages` captures outgoing messages for assertions. `cancelLeavesReceivePending` makes `cancel` leave `receive()` suspended, to simulate a stalled task (call `finish()` at the end of the test).
 - **`MockWebSocketTaskFactory`** (`MockURLSession.swift`) — Vends fresh `MockWebSocketTask` instances sequentially via internal index. `tasks` is a `var` so tests can append additional tasks for reconnection scenarios.
 - **`MockURLSession`** (`MockURLSession.swift`) — Conforms to `WebSocketURLSession`. Delegates task creation to a `MockWebSocketTaskFactory`.
 

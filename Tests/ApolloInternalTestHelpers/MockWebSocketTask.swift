@@ -68,6 +68,18 @@ public final class MockWebSocketTask: WebSocketTask, @unchecked Sendable {
     set { lock.withLock { _sendError = newValue } }
   }
 
+  private var _cancelLeavesReceivePending = false
+
+  /// When `true`, `cancel(with:reason:)` records the close code but leaves any pending `receive()`
+  /// suspended.
+  ///
+  /// Use this to simulate a task that has stopped delivering data without reporting an error, which
+  /// `cancel` may not unblock. Call ``finish()`` at the end of the test to release the receive.
+  public var cancelLeavesReceivePending: Bool {
+    get { lock.withLock { _cancelLeavesReceivePending } }
+    set { lock.withLock { _cancelLeavesReceivePending = newValue } }
+  }
+
   public var isResumed: Bool {
     lock.lock()
     defer { lock.unlock() }
@@ -166,7 +178,9 @@ public final class MockWebSocketTask: WebSocketTask, @unchecked Sendable {
     lock.lock()
     _cancelCode = closeCode
     _cancelReason = reason
+    let leavesReceivePending = _cancelLeavesReceivePending
     lock.unlock()
+    guard !leavesReceivePending else { return }
     // Match real URLSessionWebSocketTask behavior: cancelling the task causes any
     // pending receive() call to throw URLError(.cancelled).
     serverMessages.throw(URLError(.cancelled))

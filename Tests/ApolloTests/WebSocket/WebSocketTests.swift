@@ -1055,6 +1055,98 @@ class WebSocketTests: XCTestCase, MockResponseProvider {
     _ = subscription
   }
 
+  // MARK: - Pong Timeout
+
+  func testPongTimeout__whenServerRespondsToPings__shouldStayConnected() async throws {
+    setUpTransport(configuration: .init(pingInterval: 0.05, pongTimeout: 0.2))
+
+    mockTask.emit(.connectionAck(payload: nil))
+    let (subscription, _) = try await subscribe(on: mockTask, using: client)
+
+    for pingCount in 1...4 {
+      await expect(self.mockTask.clientSentMessages(ofType: "ping").count)
+        .toEventually(beGreaterThanOrEqualTo(pingCount), timeout: .seconds(2))
+      mockTask.emit(.pong(payload: nil))
+    }
+
+    expect(self.mockTask.cancelCode).to(beNil())
+    expect(self.factory.capturedRequests.count).to(equal(1))
+    await expect { await self.networkTransport.connectionState }.to(equal(.connected))
+
+    _ = subscription
+  }
+
+  func testPongTimeout__whenServerDoesNotRespond__shouldReconnectAndResubscribe() async throws {
+    let task1 = MockWebSocketTask()
+    let task2 = MockWebSocketTask()
+    // The reconnection delay leaves time for task1's receive loop to end after the timeout has
+    // already handled the disconnect, which must not finish the subscription.
+    setUpTransport(
+      tasks: [task1, task2],
+      configuration: .init(reconnectionInterval: 0.1, pingInterval: 0.1, pongTimeout: 0.2)
+    )
+
+    task1.emit(.connectionAck(payload: nil))
+    let (subscription, operationID) = try await subscribe(on: task1, using: client)
+
+    await expect(task1.cancelCode).toEventually(equal(.goingAway), timeout: .seconds(2))
+
+    task2.emit(.connectionAck(payload: nil))
+    await expect(task2.clientSentMessages(ofType: "subscribe").first?["id"] as? String)
+      .toEventually(equal(operationID), timeout: .seconds(2))
+
+    task2.emit(.next(id: operationID, payload: Self.reviewAddedPayload(stars: 5, commentary: "After timeout")))
+    task2.emit(.complete(id: operationID))
+
+    let results = try await subscription.getAllValues()
+
+    expect(results.map { $0.data?.reviewAdded?.commentary }).to(equal(["After timeout"]))
+  }
+
+  func testPongTimeout__whenTaskIgnoresCancel__shouldStillReconnect() async throws {
+    let task1 = MockWebSocketTask()
+    let task2 = MockWebSocketTask()
+    setUpTransport(
+      tasks: [task1, task2],
+      configuration: .init(reconnectionInterval: 0, pingInterval: 0.1, pongTimeout: 0.2)
+    )
+    task1.cancelLeavesReceivePending = true
+
+    task1.emit(.connectionAck(payload: nil))
+    let (subscription, operationID) = try await subscribe(on: task1, using: client)
+
+    task2.emit(.connectionAck(payload: nil))
+    await expect(task2.clientSentMessages(ofType: "subscribe").first?["id"] as? String)
+      .toEventually(equal(operationID), timeout: .seconds(2))
+    expect(task1.cancelCode).to(equal(.goingAway))
+
+    task2.emit(.next(id: operationID, payload: Self.reviewAddedPayload(stars: 4, commentary: "After stall")))
+    task2.emit(.complete(id: operationID))
+
+    let results = try await subscription.getAllValues()
+
+    expect(results.map { $0.data?.reviewAdded?.commentary }).to(equal(["After stall"]))
+
+    task1.finish()
+  }
+
+  func testPongTimeout__withoutReconnect__shouldFinishSubscriptionWithPongTimeout() async throws {
+    setUpTransport(configuration: .init(pingInterval: 0.05, pongTimeout: 0.1))
+
+    mockTask.emit(.connectionAck(payload: nil))
+    let (subscription, _) = try await subscribe(on: mockTask, using: client)
+
+    do {
+      _ = try await subscription.getAllValues()
+      fail("Expected an error to be thrown")
+    } catch {
+      expect(error).to(matchError(WebSocketTransport.Error.pongTimeout))
+    }
+
+    expect(self.mockTask.cancelCode).to(equal(.goingAway))
+    expect(self.factory.capturedRequests.count).to(equal(1))
+  }
+
   // MARK: - Unrecognized Messages
 
   func testSubscription__whenServerSendsUnrecognizedMessage__shouldTerminateWithError() async throws {

@@ -121,6 +121,7 @@ let wsTransport = try WebSocketTransport(
 | `reconnectionInterval` | `TimeInterval` | `-1` (disabled) | Seconds to wait before reconnecting after a disconnect. `0` reconnects immediately. Negative values disable auto-reconnection. |
 | `connectingPayload` | `JSONEncodableDictionary?` | `nil` | Payload sent in the `connection_init` message. Commonly used for authentication. |
 | `pingInterval` | `TimeInterval?` | `nil` (disabled) | Interval at which the client sends `ping` keepalive messages to the server. The transport will always respond to server initiated `ping` messages by sending a `pong` regardless of this setting. |
+| `pongTimeout` | `TimeInterval?` | `nil` (disabled) | How long to wait for the server to respond after a client `ping` before treating the connection as dead. Requires `pingInterval`. See [Detecting dead connections](#detecting-dead-connections). |
 | `requestBodyCreator` | `JSONRequestBodyCreator` | `DefaultRequestBodyCreator()` | Builds the JSON payload for `subscribe` messages. |
 | `operationMessageIdCreator` | `OperationMessageIdCreator` | `ApolloSequencedOperationMessageIdCreator()` | Generates unique IDs for each operation message. |
 | `clientAwarenessMetadata` | `ClientAwarenessMetadata` | `ClientAwarenessMetadata()` | Adds Apollo Client name/version headers to the WebSocket handshake request. |
@@ -310,6 +311,20 @@ let config = WebSocketTransport.Configuration(
 
 Pings are only sent after the server sends `connection_ack`. The timer pauses on disconnect or `pause()` and restarts on reconnect or `resume()`.
 
+### Detecting dead connections
+
+A connection can stop delivering data without reporting an error, for example after a network change leaves a half-open TCP connection. Sends still appear to succeed, so subscriptions silently stop receiving updates. Set `pongTimeout` to detect this:
+
+```swift
+let config = WebSocketTransport.Configuration(
+  reconnectionInterval: 5,
+  pingInterval: 20,  // send a ping every 20 seconds
+  pongTimeout: 10    // treat the connection as dead if the server sends nothing for 10 seconds after a ping
+)
+```
+
+Any message from the server counts as a response. The `graphql-transport-ws` protocol requires servers to answer each `ping` with a `pong`. If nothing arrives in time, the transport closes the connection and handles it like any other disconnect: it reconnects and re-subscribes active subscriptions when auto-reconnection is enabled, and otherwise finishes operations with `WebSocketTransport.Error.pongTimeout`.
+
 ## Custom operation message IDs
 
 By default, operations are identified by sequential integers (`"1"`, `"2"`, `"3"`, ...). To use custom identifiers, implement `OperationMessageIdCreator`:
@@ -342,6 +357,8 @@ do {
   // The server returned GraphQL errors for the operation.
 } catch WebSocketTransport.Error.unrecognizedMessage {
   // A message was received that doesn't conform to graphql-transport-ws.
+} catch WebSocketTransport.Error.pongTimeout {
+  // The server stopped responding to pings and auto-reconnection is disabled.
 } catch {
   // Other errors (e.g., network connectivity).
 }

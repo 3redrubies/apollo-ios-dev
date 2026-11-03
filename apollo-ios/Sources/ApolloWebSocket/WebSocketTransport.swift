@@ -13,6 +13,9 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
     case connectionClosed
     /// The server sent one or more GraphQL errors for an operation.
     case graphQLErrors([GraphQLError])
+    /// The server sent nothing within ``Configuration/pongTimeout`` of a client `ping`, so the
+    /// connection was treated as dead.
+    case pongTimeout
   }
 
   /// Configuration options for ``WebSocketTransport``.
@@ -58,10 +61,26 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
     /// - A value of `nil` disables client-initiated pings (the default).
     ///
     /// Pings are only sent after `connection_ack` is received. The timer is stopped on
-    /// disconnect or pause, and restarted on reconnect.
+    /// disconnect or pause, and restarted on reconnect. Set ``pongTimeout`` to also detect a
+    /// connection that has stopped responding.
     ///
     /// Default: `nil` (disabled).
     public var pingInterval: TimeInterval?
+
+    /// How long to wait for the server to respond after a client `ping` before treating the
+    /// connection as dead. Only used when ``pingInterval`` is set.
+    ///
+    /// Any message from the server counts as a response. The `graphql-transport-ws` protocol
+    /// requires the server to answer each `ping` with a `pong`. If nothing arrives in time, the
+    /// transport closes the connection and handles it like any other disconnect: it reconnects
+    /// when ``reconnectionInterval`` allows, and otherwise finishes operations with
+    /// ``WebSocketTransport/Error/pongTimeout``.
+    ///
+    /// This detects connections that stop delivering data without reporting an error, such as a
+    /// half-open TCP connection left behind by a network change.
+    ///
+    /// Default: `nil` (disabled).
+    public var pongTimeout: TimeInterval?
 
     /// Metadata used by GraphOS Studio's
     /// [client awareness](https://www.apollographql.com/docs/graphos/platform/insights/client-segmentation)
@@ -80,6 +99,7 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
       connectingPayload: JSONEncodableDictionary? = nil,
       operationMessageIdCreator: any OperationMessageIdCreator = ApolloSequencedOperationMessageIdCreator(),
       pingInterval: TimeInterval? = nil,
+      pongTimeout: TimeInterval? = nil,
       clientAwarenessMetadata: ClientAwarenessMetadata = ClientAwarenessMetadata()
     ) {
       self.reconnectionInterval = reconnectionInterval
@@ -87,6 +107,7 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
       self.connectingPayload = connectingPayload
       self.operationMessageIdCreator = operationMessageIdCreator
       self.pingInterval = pingInterval
+      self.pongTimeout = pongTimeout
       self.clientAwarenessMetadata = clientAwarenessMetadata
     }
   }
@@ -142,6 +163,11 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
   /// Created after `connection_ack` and cancelled on disconnect/pause.
   private var pingTimerTask: Task<Void, Never>?
 
+  /// The task that disconnects the current connection if the server doesn't respond to a ping
+  /// within `pongTimeout`. Started by the oldest unanswered ping and cancelled by any message
+  /// from the server.
+  private var pongTimeoutTask: Task<Void, Never>?
+
   /// The number of active subscribers. Exposed for test assertions.
   var subscriberCount: Int { subscriberRegistry.count }
 
@@ -166,6 +192,7 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
 
   deinit {
     pingTimerTask?.cancel()
+    pongTimeoutTask?.cancel()
     connection.close()
   }
 
@@ -254,7 +281,9 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
 
   /// Handles a disconnection from the receive loop opened on `loopConnection`.
   ///
-  /// Ignored if `loopConnection` is no longer the current connection or the transport is paused.
+  /// Ignored if `loopConnection` is no longer the current connection, its disconnection has
+  /// already been handled, or the transport is paused. A pong timeout handles the disconnection
+  /// before the connection's receive loop ends, so both can report the same connection.
   ///
   /// When `error` is nil, this is a normal disconnection (stream ended cleanly or task was
   /// cancelled). When non-nil, the error is forwarded to connection waiters and subscribers
@@ -267,7 +296,9 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
     of loopConnection: WebSocketConnection,
     error: (any Swift.Error)? = nil
   ) async {
-    guard connection === loopConnection, connectionState != .paused else { return }
+    guard connection === loopConnection,
+          connectionState != .disconnected,
+          connectionState != .paused else { return }
 
     let wasConnected = (self.connectionState == .connected)
     self.connectionState = .disconnected
@@ -380,18 +411,58 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
 
         guard let _ = self, !Task.isCancelled else { break }
 
-        guard let pingMessage = try? Message.Outgoing.ping(payload: nil).toWebSocketMessage() else {
-          continue
-        }
-        connection.send(pingMessage)
+        await self?.sendPing(on: connection)
       }
     }
   }
 
-  /// Stops the periodic ping timer.
+  /// Sends a `ping` on `connection` and starts the pong timeout if one isn't already running.
+  private func sendPing(on connection: WebSocketConnection) {
+    guard self.connection === connection,
+          connectionState == .connected,
+          let pingMessage = try? Message.Outgoing.ping(payload: nil).toWebSocketMessage() else {
+      return
+    }
+    connection.send(pingMessage)
+
+    // Measure from the oldest unanswered ping, so a timeout longer than the ping interval isn't
+    // pushed back by every new ping.
+    guard pongTimeoutTask == nil, let timeout = configuration.pongTimeout, timeout > 0 else { return }
+
+    pongTimeoutTask = Task { [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+      } catch {
+        return
+      }
+      await self?.handlePongTimeout(on: connection)
+    }
+  }
+
+  /// Treats `timedOutConnection` as dead because the server sent nothing within `pongTimeout` of
+  /// a ping.
+  ///
+  /// Handles the disconnection here rather than waiting for `close()` to end the receive loop: a
+  /// task that has stopped delivering data may ignore `cancel`, leaving its pending `receive()`
+  /// suspended indefinitely.
+  private func handlePongTimeout(on timedOutConnection: WebSocketConnection) async {
+    guard !Task.isCancelled,
+          connection === timedOutConnection,
+          connectionState == .connected else { return }
+
+    // Clear the task first so `stopPingTimer()` doesn't cancel the task this runs on, which would
+    // cancel the reconnection delay.
+    pongTimeoutTask = nil
+    timedOutConnection.close()
+    await handleDisconnection(of: timedOutConnection, error: Error.pongTimeout)
+  }
+
+  /// Stops the periodic ping timer and any pending pong timeout.
   private func stopPingTimer() {
     pingTimerTask?.cancel()
     pingTimerTask = nil
+    pongTimeoutTask?.cancel()
+    pongTimeoutTask = nil
   }
 
   // MARK: - Runtime Configuration Updates
@@ -594,6 +665,9 @@ public actor WebSocketTransport: SubscriptionNetworkTransport, NetworkTransport 
     from loopConnection: WebSocketConnection
   ) {
     guard connection === loopConnection else { return }
+
+    pongTimeoutTask?.cancel()
+    pongTimeoutTask = nil
 
     do {
       let incoming = try Message.Incoming.from(message)
