@@ -735,7 +735,7 @@ class IRFieldCollectorTests: XCTestCase {
     expect(reverseOrderActual).to(equal(expected))
   }
 
-  func test__collectedFields__givenResponseKeySelectedOnObjectAndInterfacesWithDifferentTypes_collectsSameTypeRegardlessOfWhereSelected() async throws {
+  func test__collectedFields__givenResponseKeySelectedOnObjectAndInterfacesWithDifferentFields_collectsObjectFieldThenInterfaceFieldsInImplementsOrder() async throws {
     // given
     schemaSDL = """
     type Query {
@@ -760,6 +760,11 @@ class IRFieldCollectorTests: XCTestCase {
     }
 
     type Magazine implements Named & Titled {
+      title: String!
+      shortTitle: String
+    }
+
+    type Novel implements Named & Titled {
       title: String!
       shortTitle: String
     }
@@ -789,6 +794,75 @@ class IRFieldCollectorTests: XCTestCase {
     try await buildIR()
     let Book = try schema[object: "Book"].xctUnwrapped()
     let Magazine = try schema[object: "Magazine"].xctUnwrapped()
+    let Novel = try schema[object: "Novel"].xctUnwrapped()
+    let documentOrderBookActual = await subject.collectedFields(for: Book)
+    let documentOrderMagazineActual = await subject.collectedFields(for: Magazine)
+    let documentOrderNovelActual = await subject.collectedFields(for: Novel)
+
+    try await buildIR(reverseOperationOrder: true)
+    let reverseOrderBookActual = await subject.collectedFields(for: Book)
+    let reverseOrderMagazineActual = await subject.collectedFields(for: Magazine)
+    let reverseOrderNovelActual = await subject.collectedFields(for: Novel)
+
+    // then
+    let titledExpected: ReferencedFields = [
+      ("title", .nonNull(.string()), nil)
+    ]
+    let namedExpected: ReferencedFields = [
+      ("title", .string(), nil)
+    ]
+
+    expect(documentOrderBookActual).to(equal(titledExpected))
+    expect(documentOrderMagazineActual).to(equal(titledExpected))
+    expect(documentOrderNovelActual).to(equal(namedExpected))
+    expect(reverseOrderBookActual).to(equal(titledExpected))
+    expect(reverseOrderMagazineActual).to(equal(titledExpected))
+    expect(reverseOrderNovelActual).to(equal(namedExpected))
+  }
+
+  func test__collectedFields__givenFieldDeclaredWithDifferentTypesOnInterfaces_collectsInterfaceFieldsInImplementsOrder() async throws {
+    // given
+    schemaSDL = """
+    type Query {
+      titled: Titled!
+      strictlyTitled: StrictlyTitled!
+    }
+
+    interface Titled {
+      title: String
+    }
+
+    interface StrictlyTitled {
+      title: String!
+    }
+
+    type Book implements StrictlyTitled & Titled {
+      title: String!
+    }
+
+    type Magazine implements Titled & StrictlyTitled {
+      title: String!
+    }
+    """
+
+    document = """
+    query TitledQuery {
+      titled {
+        title
+      }
+    }
+
+    query StrictlyTitledQuery {
+      strictlyTitled {
+        title
+      }
+    }
+    """
+
+    // when
+    try await buildIR()
+    let Book = try schema[object: "Book"].xctUnwrapped()
+    let Magazine = try schema[object: "Magazine"].xctUnwrapped()
     let documentOrderBookActual = await subject.collectedFields(for: Book)
     let documentOrderMagazineActual = await subject.collectedFields(for: Magazine)
 
@@ -797,14 +871,17 @@ class IRFieldCollectorTests: XCTestCase {
     let reverseOrderMagazineActual = await subject.collectedFields(for: Magazine)
 
     // then
-    let expected: ReferencedFields = [
+    let bookExpected: ReferencedFields = [
+      ("title", .nonNull(.string()), nil)
+    ]
+    let magazineExpected: ReferencedFields = [
       ("title", .string(), nil)
     ]
 
-    expect(documentOrderBookActual).to(equal(expected))
-    expect(documentOrderMagazineActual).to(equal(expected))
-    expect(reverseOrderBookActual).to(equal(expected))
-    expect(reverseOrderMagazineActual).to(equal(expected))
+    expect(documentOrderBookActual).to(equal(bookExpected))
+    expect(documentOrderMagazineActual).to(equal(magazineExpected))
+    expect(reverseOrderBookActual).to(equal(bookExpected))
+    expect(reverseOrderMagazineActual).to(equal(magazineExpected))
   }
 
   func test__collectedFields__givenInterfaceFieldNarrowedByObject_selectedOnObjectAndInterface_collectsObjectFieldType() async throws {
@@ -872,6 +949,102 @@ class IRFieldCollectorTests: XCTestCase {
 
     expect(documentOrderActual).to(equal(expected))
     expect(reverseOrderActual).to(equal(expected))
+  }
+
+  func test__responseKeyConflicts__givenResponseKeySelectedWithDifferentFields_returnsConflictsUsedByCollectedFields() async throws {
+    // given
+    schemaSDL = """
+    type Query {
+      book: Book!
+      titled: Titled!
+    }
+
+    interface Titled {
+      title: String!
+      shortTitle: String
+    }
+
+    type Book implements Titled {
+      title: String!
+      shortTitle: String
+      name: String!
+      cover: Image
+      thumbnail: Thumbnail
+    }
+
+    type Magazine implements Titled {
+      title: String!
+      shortTitle: String
+    }
+
+    type Image {
+      url: String
+    }
+
+    type Thumbnail {
+      url: String
+    }
+    """
+
+    document = """
+    query BookQuery {
+      book {
+        title
+        cover {
+          url
+        }
+      }
+      titled {
+        title
+      }
+    }
+
+    query AliasedBookQuery {
+      book {
+        title: name
+        cover: thumbnail {
+          url
+        }
+      }
+      titled {
+        title: shortTitle
+      }
+    }
+    """
+
+    // when
+    try await buildIR()
+    let Book = try schema[object: "Book"].xctUnwrapped()
+    let Magazine = try schema[object: "Magazine"].xctUnwrapped()
+    let documentOrderBookActual = await subject.responseKeyConflicts(for: Book)
+    let documentOrderMagazineActual = await subject.responseKeyConflicts(for: Magazine)
+
+    try await buildIR(reverseOperationOrder: true)
+    let reverseOrderBookActual = await subject.responseKeyConflicts(for: Book)
+    let reverseOrderMagazineActual = await subject.responseKeyConflicts(for: Magazine)
+
+    // then
+    let Image = try schema[object: "Image"].xctUnwrapped()
+    let Thumbnail = try schema[object: "Thumbnail"].xctUnwrapped()
+
+    for actual in [documentOrderBookActual, reverseOrderBookActual] {
+      expect(actual.map(\.responseKey)).to(Nimble.equal(["cover"]))
+      expect(actual.first?.fields.map(\.name)).to(Nimble.equal(["cover", "thumbnail"]))
+      expect(actual.first?.fields.map(\.type)).to(Nimble.equal([.entity(Image), .entity(Thumbnail)]))
+    }
+
+    for actual in [documentOrderMagazineActual, reverseOrderMagazineActual] {
+      expect(actual.map(\.responseKey)).to(Nimble.equal(["title"]))
+      expect(actual.first?.fields.map(\.name)).to(Nimble.equal(["shortTitle", "title"]))
+      expect(actual.first?.fields.map(\.type)).to(Nimble.equal([.string(), .nonNull(.string())]))
+    }
+
+    let magazineConflict = try documentOrderMagazineActual.first.xctUnwrapped()
+    expect(ApolloCodegen.warning(for: magazineConflict, on: Magazine)).to(Nimble.equal(
+      "Response key \"title\" in the test mock for \"Magazine\" is selected with different fields " +
+      "in different operations or fragments: shortTitle (String), title (String!). " +
+      "The test mock uses shortTitle (String)."
+    ))
   }
 
   /// MARK: - Custom Matchers

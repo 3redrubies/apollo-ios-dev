@@ -6,6 +6,15 @@ public actor FieldCollector {
 
   private typealias FieldInfo = (GraphQLType, deprecationReason: String?)
 
+  /// A response key in `collectedFields(for:)` that was chosen from different schema fields
+  /// whose types or deprecation reasons differ.
+  public struct ResponseKeyConflict: Sendable {
+    public let responseKey: String
+    /// The schema fields selected with the response key. The first is the one used in
+    /// `collectedFields(for:)`.
+    public let fields: [(name: String, type: GraphQLType, deprecationReason: String?)]
+  }
+
   /// Collected fields keyed by response key, then by the name of the schema field that was
   /// selected with that response key.
   private var collectedFields: [GraphQLCompositeType: [String: [String: FieldInfo]]] = [:]
@@ -37,26 +46,55 @@ public actor FieldCollector {
   public func collectedFields(
     for type: any GraphQLInterfaceImplementingType
   ) -> [(String, GraphQLType, deprecationReason: String?)] {
-    var fields: [String: [String: FieldInfo]] = [:]
+    candidateFields(for: type)
+      .sorted { $0.key < $1.key }
+      .compactMap { key, candidates in
+        Self.sorted(candidates).first.map { (key, $0.value.0, $0.value.deprecationReason) }
+      }
+  }
+
+  /// The response keys in `collectedFields(for:)` that were chosen from different schema fields
+  /// whose types or deprecation reasons differ, sorted by response key.
+  public func responseKeyConflicts(
+    for type: any GraphQLInterfaceImplementingType
+  ) -> [ResponseKeyConflict] {
+    candidateFields(for: type)
+      .sorted { $0.key < $1.key }
+      .compactMap { responseKey, candidates in
+        let sortedCandidates = Self.sorted(candidates)
+        guard let first = sortedCandidates.first?.value,
+              sortedCandidates.contains(where: { $0.value != first }) else {
+          return nil
+        }
+
+        return ResponseKeyConflict(
+          responseKey: responseKey,
+          fields: sortedCandidates.map { ($0.key, $0.value.0, $0.value.deprecationReason) }
+        )
+      }
+  }
+
+  /// The schema fields selected with each response key, from `type` itself or else from the
+  /// first of its interfaces that selects the response key.
+  private func candidateFields(
+    for type: any GraphQLInterfaceImplementingType
+  ) -> [String: [String: FieldInfo]] {
+    var fields = collectedFields[type] ?? [:]
 
     for interface in type.interfaces {
       if let interfaceFields = collectedFields[interface] {
-        fields.merge(interfaceFields) { existing, inherited in
-          existing.merging(inherited) { Self.isOrdered($0, before: $1) ? $0 : $1 }
-        }
+        fields.merge(interfaceFields) { field, _ in field }
       }
     }
 
-    if let ownFields = collectedFields[type] {
-      fields.merge(ownFields) { inherited, own in
-        inherited.merging(own) { _, ownField in ownField }
-      }
-    }
+    return fields
+  }
 
-    return fields.sorted { $0.key < $1.key }.compactMap { key, candidates in
-      candidates.values
-        .min { Self.isOrdered($0, before: $1) }
-        .map { (key, $0.0, deprecationReason: $0.deprecationReason) }
+  private static func sorted(_ candidates: [String: FieldInfo]) -> [(key: String, value: FieldInfo)] {
+    candidates.sorted {
+      if isOrdered($0.value, before: $1.value) { return true }
+      if isOrdered($1.value, before: $0.value) { return false }
+      return $0.key < $1.key
     }
   }
 

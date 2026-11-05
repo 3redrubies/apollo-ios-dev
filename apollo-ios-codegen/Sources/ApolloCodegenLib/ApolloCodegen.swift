@@ -445,6 +445,14 @@ public final class ApolloCodegen: Sendable {
   ) async throws -> NonFatalErrors {
     let config = config
 
+    if config.output.testMocks != .none {
+      for graphqlObject in ir.schema.referencedTypes.objects {
+        for conflict in await ir.fieldCollector.responseKeyConflicts(for: graphqlObject) {
+          CodegenLogger.log(Self.warning(for: conflict, on: graphqlObject), logLevel: .warning)
+        }
+      }
+    }
+
     var nonFatalErrors = NonFatalErrors()
 
     nonFatalErrors.merge(
@@ -599,6 +607,22 @@ public final class ApolloCodegen: Sendable {
     )
 
     return nonFatalErrors
+  }
+
+  static func warning(
+    for conflict: FieldCollector.ResponseKeyConflict,
+    on graphqlObject: GraphQLObjectType
+  ) -> String {
+    let fields = conflict.fields.map { field in
+      let deprecation = field.deprecationReason.map { ", deprecated: \($0)" } ?? ""
+      return "\(field.name) (\(field.type.debugDescription)\(deprecation))"
+    }
+
+    return """
+      Response key "\(conflict.responseKey)" in the test mock for "\(graphqlObject.name.schemaName)" \
+      is selected with different fields in different operations or fragments: \
+      \(fields.joined(separator: ", ")). The test mock uses \(fields[0]).
+      """
   }
 
   /// MARK: - Generated File Pruning
